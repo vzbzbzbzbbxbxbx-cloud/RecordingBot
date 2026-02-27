@@ -35,7 +35,7 @@ class RecordingTask:
 
 
 class TaskManager:
-    def __init__(self, max_concurrent: int = 3):
+    def __init__(self, max_concurrent: int = 3, executor=None, **_kwargs):
         self.max_concurrent = max(1, int(max_concurrent))
         self._sem = asyncio.Semaphore(self.max_concurrent)
 
@@ -45,6 +45,7 @@ class TaskManager:
 
         self._workers: List[asyncio.Task] = []
         self._runner: Optional[Callable[[RecordingTask], Awaitable[None]]] = None
+        self.executor = executor
         self._closed = False
 
     def bind_runner(self, runner: Callable[[RecordingTask], Awaitable[None]]) -> None:
