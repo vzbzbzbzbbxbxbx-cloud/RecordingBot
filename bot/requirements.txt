@@ -1,0 +1,10 @@
+# bot/requirements.txt
+python-telegram-bot==20.7
+psutil==5.9.8
+
+# MongoDB async driver
+motor==3.3.2
+pymongo==4.7.1
+
+# HTTP client (upload with progress + playlist fetch)
+aiohttp==3.9.5
