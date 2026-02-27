@@ -74,7 +74,7 @@ MongoDB is used to store and track:
 ```bash
 pip install -r bot/requirements.txt
 
-Configure environment
+## Configure environment
 Copy env.example → .env and fill values:
 Required
 BOT_TOKEN=...
@@ -91,10 +91,10 @@ Daily Reset
 DAILY_RESET_TIME=23:59
 (Reset uses Asia/Dhaka logic by default in code/config.)
 
-Run the bot
+## Run the bot
 python -m bot.main
 
-Usage Guide
+## Usage Guide
 /playlist
 Add a playlist in two ways:
 Reply to a playlist file (m3u / m3u8)
@@ -157,7 +157,8 @@ Add a proxy:
 Remove proxy:
 Run /proxy with no args → bot shows inline buttons to remove.
 Proxy is saved to MongoDB and applied to fetch/upload modules that support it.
-File Splitting & Upload Rules
+
+##File Splitting & Upload Rules
 If output file exceeds 2000MB, it is split into parts:
 Name.part01.mp4
 Name.part02.mp4
@@ -168,7 +169,7 @@ bot tries upload as video
 if Telegram rejects → bot remuxes to .mp4 then uploads
 
 
-Folder Structure (high level)
+## Folder Structure (high level)
 bot/
   main.py                # bot entrypoint
   config.py              # config/env loader
@@ -193,7 +194,7 @@ bot/
     hls_master.py        # quality/audio parsing for master playlists
     ffprobe.py           # duration/streams detection helpers
 
-MongoDB Collections (typical)
+## MongoDB Collections (typical)
 users
 user_id
 premium_until
@@ -211,7 +212,7 @@ enabled
 scheduled_jobs
 job_id, user_id, run_at, source, duration, filename, status
 
-Upload fails for MKV
+## Upload fails for MKV
 Bot will attempt .mp4 remux automatically. If still failing:
 Check file size per part (2GB cap)
 Check bot API limits / Telegram restrictions
@@ -221,5 +222,5 @@ MONGO_URI is correct
 IP whitelist is set (Atlas)
 DB user has permissions
 
-Credits
+## Credits
 Built and branded by @DoraemonBro.
