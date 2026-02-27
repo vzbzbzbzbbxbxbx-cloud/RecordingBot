@@ -1,0 +1,19 @@
+# Core Telegram bot
+python-telegram-bot==21.6
+
+# Async HTTP (playlist fetch, proxy support, custom upload streaming)
+aiohttp==3.10.11
+
+# MongoDB (async)
+motor==3.6.0
+pymongo==4.9.2
+
+# System stats (/stats)
+psutil==6.0.0
+
+# Parsing helpers
+python-dateutil==2.9.0.post0
+pytz==2024.2
+
+# Optional: robust URL parsing / retry utilities
+yarl==1.12.1
