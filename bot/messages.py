@@ -1,4 +1,3 @@
-from messages.generated import MESSAGES as GENERATED_MESSAGES
 # bot/messages.py
 """
 messages.py
