@@ -192,3 +192,77 @@ THEMES = {"cold": ColdTheme(), "hot": HotTheme(), "dark": DarkTheme()}
 
 def get_theme(name: str):
     return THEMES.get((name or "cold").lower(), THEMES["cold"])
+# =========================
+# Theme storage helpers
+# Used by: bot/access.py and /hot /cold /dark handlers
+# =========================
+
+try:
+    from .config import DEFAULT_THEME
+except Exception:
+    DEFAULT_THEME = "cold"
+
+_THEMES = {"hot", "cold", "dark"}
+
+
+def _normalize_theme(t: str) -> str:
+    t = (t or DEFAULT_THEME).lower()
+    return t if t in _THEMES else DEFAULT_THEME
+
+
+async def get_theme_for_user(context, user_id: int) -> str:
+    """
+    Returns user's theme (hot/cold/dark).
+    Tries MongoDB first (context.application.bot_data["db"]).
+    Falls back to in-memory store.
+    """
+    # Try DB (Mongo)
+    db = None
+    try:
+        db = context.application.bot_data.get("db")
+    except Exception:
+        db = None
+
+    if db:
+        try:
+            doc = await db.get_user(user_id)
+            return _normalize_theme(doc.get("theme"))
+        except Exception:
+            pass
+
+    # Fallback memory
+    try:
+        mem = context.application.bot_data.setdefault("themes", {})
+        return _normalize_theme(mem.get(user_id, DEFAULT_THEME))
+    except Exception:
+        return DEFAULT_THEME
+
+
+async def set_theme_for_user(context, user_id: int, theme: str) -> str:
+    """
+    Sets user's theme in MongoDB if available, else in-memory.
+    Returns the normalized theme actually stored.
+    """
+    theme = _normalize_theme(theme)
+
+    db = None
+    try:
+        db = context.application.bot_data.get("db")
+    except Exception:
+        db = None
+
+    if db:
+        try:
+            await db.update_user(user_id, {"theme": theme})
+            return theme
+        except Exception:
+            pass
+
+    # Fallback memory
+    try:
+        mem = context.application.bot_data.setdefault("themes", {})
+        mem[user_id] = theme
+    except Exception:
+        pass
+
+    return theme
