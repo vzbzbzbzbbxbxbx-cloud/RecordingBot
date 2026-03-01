@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 from telegram import Update
 from telegram.constants import ChatType
 from telegram.ext import (
+    Application,
     ApplicationBuilder,
     CommandHandler,
     CallbackQueryHandler,
@@ -48,28 +49,123 @@ logger = logging.getLogger(__name__)
 # Helpers
 # -------------------------
 
+
 def _is_url(s: str) -> bool:
-    return s.lower().startswith(("http://", "https://"))
+    return (s or "").lower().startswith(("http://", "https://"))
+
 
 def _norm_filename(name: str) -> str:
-    name = name.strip().replace("\n", " ")
-    return name[:120] if len(name) > 120 else name
+    name = (name or "").strip().replace("\n", " ")
+    return name[:120] if len(name) > 120 else (name or "recording")
+
 
 async def _theme(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> str:
     return await ui.get_theme_for_user(context, user_id)
 
+
 async def _db(context: ContextTypes.DEFAULT_TYPE) -> DB:
-    db: DB = context.application.bot_data["db"]
+    # Avoid KeyError explosions on early startup
+    db = context.application.bot_data.get("db")
+    if not db:
+        raise RuntimeError("DB not initialized yet")
     return db
+
 
 # pending selections (quality/audio)
 # pending_id -> dict
 def _pending_store(context: ContextTypes.DEFAULT_TYPE) -> Dict[str, Dict[str, Any]]:
     return context.application.bot_data.setdefault("pending", {})
 
+
+def _safe_msg(theme_name: str, key: str, **kwargs: Any) -> str:
+    """
+    Wrapper for Msg.get that:
+    - avoids crashing if Msg.get has 'theme' param name collision
+    - fills {theme} placeholder if present, without passing theme=... into kwargs
+    """
+    # never pass theme kw to avoid collision with Msg.get(theme=...)
+    kwargs2 = dict(kwargs)
+    kwargs2.pop("theme", None)
+    try:
+        text = Msg.get(theme_name, key, **kwargs2)
+    except TypeError:
+        # worst case: older Msg.get signature differences
+        text = Msg.get(theme_name, key)
+
+    # Fill template placeholder if messages.py uses {theme}
+    if "{theme}" in text:
+        text = text.replace("{theme}", str(theme_name))
+    return text
+
+
+async def _tm_snapshot(tm: TaskManager) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Support both TaskManager implementations:
+    - newer: async snapshot()
+    - older: get_active(), get_queued()
+    """
+    if hasattr(tm, "snapshot"):
+        snap = tm.snapshot()
+        if asyncio.iscoroutine(snap):
+            return await snap
+        return snap  # type: ignore[return-value]
+
+    def _to_dict(t: Any) -> Dict[str, Any]:
+        return {
+            "task_id": getattr(t, "task_id", "?"),
+            "user_id": getattr(t, "user_id", "?"),
+            "state": getattr(t, "state", "?"),
+            "filename": getattr(t, "filename", "?"),
+        }
+
+    active: List[Dict[str, Any]] = []
+    queued: List[Dict[str, Any]] = []
+    try:
+        if hasattr(tm, "get_active"):
+            active = [_to_dict(x) for x in tm.get_active()]  # type: ignore[attr-defined]
+        if hasattr(tm, "get_queued"):
+            queued = [_to_dict(x) for x in tm.get_queued()]  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+    return {"active": active, "queued": queued}
+
+
+def _task_with_theme(**kwargs: Any) -> RecordingTask:
+    """
+    Create RecordingTask while being compatible with dataclass versions
+    that may not include theme_name / reply_to_message_id fields.
+    """
+    theme_name = kwargs.pop("theme_name", DEFAULT_THEME)
+    reply_to_message_id = kwargs.pop("reply_to_message_id", None)
+
+    task = RecordingTask(**kwargs)  # type: ignore[arg-type]
+
+    # Attach optional attributes if dataclass doesn't define them
+    try:
+        setattr(task, "theme_name", theme_name)
+    except Exception:
+        pass
+    try:
+        if reply_to_message_id is not None:
+            setattr(task, "reply_to_message_id", reply_to_message_id)
+    except Exception:
+        pass
+
+    return task
+
+
+def _parse_record_parts(raw_text: str) -> List[str]:
+    try:
+        return shlex.split(raw_text)
+    except Exception:
+        return (raw_text or "").split()
+
+
 # -------------------------
 # Commands
 # -------------------------
+
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await enforce_access_or_reply(update, context):
@@ -77,12 +173,13 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user:
         return
+
     db = await _db(context)
     await db.ensure_user(user.id)
+
     t = await _theme(context, user.id)
-    await update.effective_message.reply_text(
-        Msg.get(t, "system.start", version=BOT_VERSION, theme=t)
-    )
+    await update.effective_message.reply_text(_safe_msg(t, "system.start", version=BOT_VERSION))
+
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await enforce_access_or_reply(update, context):
@@ -90,17 +187,22 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user:
         return
+
     t = await _theme(context, user.id)
-    await update.effective_message.reply_text(Msg.get(t, "system.help"))
+    await update.effective_message.reply_text(_safe_msg(t, "system.help"))
+
 
 async def hot_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _set_theme_cmd(update, context, "hot")
 
+
 async def cold_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _set_theme_cmd(update, context, "cold")
 
+
 async def dark_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _set_theme_cmd(update, context, "dark")
+
 
 async def _set_theme_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, theme_name: str):
     if not await enforce_access_or_reply(update, context):
@@ -108,12 +210,15 @@ async def _set_theme_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, the
     user = update.effective_user
     if not user:
         return
+
     await ui.set_theme_for_user(context, user.id, theme_name)
-    await update.effective_message.reply_text(Msg.get(theme_name, "system.theme_set", theme=theme_name))
+    await update.effective_message.reply_text(_safe_msg(theme_name, "system.theme_set"))
+
 
 # -------------------------
 # Playlist / channels
 # -------------------------
+
 
 async def playlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await enforce_access_or_reply(update, context):
@@ -121,6 +226,7 @@ async def playlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user:
         return
+
     db = await _db(context)
     t = await _theme(context, user.id)
     msg = update.effective_message
@@ -128,8 +234,8 @@ async def playlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # owner proxy (optional) affects playlist fetch
     proxy_url = await db.get_setting("proxy_url", None)
 
-    url = None
-    file_id = None
+    url: Optional[str] = None
+    file_id: Optional[str] = None
 
     # /playlist <url>
     if context.args:
@@ -138,24 +244,25 @@ async def playlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # reply to url or file
     if msg.reply_to_message:
         r = msg.reply_to_message
-        if r.document:
-            file_id = r.document.file_id
-        elif r.text and _is_url(r.text.strip()):
-            url = r.text.strip()
+        if getattr(r, "document", None):
+            file_id = r.document.file_id  # type: ignore[union-attr]
+        elif getattr(r, "text", None) and _is_url(r.text.strip()):  # type: ignore[union-attr]
+            url = r.text.strip()  # type: ignore[union-attr]
 
     try:
         if url and _is_url(url):
             count = await save_playlist_from_url(db, user.id, url, proxy=proxy_url)
-            await msg.reply_text(Msg.get(t, "playlist.added_url", count=count, refresh=PLAYLIST_REFRESH_SEC))
+            await msg.reply_text(_safe_msg(t, "playlist.added_url", count=count, refresh=PLAYLIST_REFRESH_SEC))
             return
         if file_id:
             count = await save_playlist_from_file(db, context.bot, user.id, file_id)
-            await msg.reply_text(Msg.get(t, "playlist.added_file", count=count))
+            await msg.reply_text(_safe_msg(t, "playlist.added_file", count=count))
             return
-    except Exception as e:
+    except Exception:
         logger.exception("playlist save failed")
 
-    await msg.reply_text(Msg.get(t, "playlist.invalid"))
+    await msg.reply_text(_safe_msg(t, "playlist.invalid"))
+
 
 async def channel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await enforce_access_or_reply(update, context):
@@ -163,25 +270,31 @@ async def channel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user:
         return
+
     db = await _db(context)
     t = await _theme(context, user.id)
+
     pl = await db.get_playlist(user.id)
     if not pl or not pl.get("channels"):
-        await update.effective_message.reply_text(Msg.get(t, "playlist.none"))
+        await update.effective_message.reply_text(_safe_msg(t, "playlist.none"))
         return
+
     channels = pl.get("channels", [])
-    # show top 40
     take = channels[:40]
-    text = [Msg.get(t, "channel.header", count=len(channels))]
+
+    text = [_safe_msg(t, "channel.header", count=len(channels))]
     for idx, ch in enumerate(take, 1):
-        text.append(Msg.get(t, "channel.item", idx=idx, name=ch.get("name","?")))
+        text.append(_safe_msg(t, "channel.item", idx=idx, name=ch.get("name", "?")))
     if len(channels) > len(take):
-        text.append(f"\n… and {len(channels)-len(take)} more.")
+        text.append(f"\n… and {len(channels) - len(take)} more.")
+
     await update.effective_message.reply_text("\n".join(text))
+
 
 # -------------------------
 # Record / schedule
 # -------------------------
+
 
 async def record_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await enforce_access_or_reply(update, context):
@@ -189,17 +302,13 @@ async def record_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user:
         return
+
     db = await _db(context)
     t = await _theme(context, user.id)
 
-    # Parse args with quotes support
-    try:
-        parts = shlex.split(update.effective_message.text)
-    except Exception:
-        parts = (update.effective_message.text or "").split()
-
+    parts = _parse_record_parts(update.effective_message.text or "")
     if len(parts) < 4:
-        await update.effective_message.reply_text(Msg.get(t, "system.help"))
+        await update.effective_message.reply_text(_safe_msg(t, "system.help"))
         return
 
     source = parts[1]
@@ -207,29 +316,63 @@ async def record_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     filename = _norm_filename(parts[3])
 
     dur_sec = parse_duration_hms(duration_s)
-    if dur_sec is None or dur_sec <= 0:
+    if dur_sec is None:
+        await update.effective_message.reply_text("❌ Duration must be HH:MM:SS (use 00:00:00 for LIVE)")
+        return
+
+    # LIVE mode requested with 00:00:00
+    duration_label = duration_s
+    if dur_sec == 0:
+        if user.id == OWNER_ID:
+            # Chunk pipeline currently expects a finite duration; use large duration and rely on /cancel.
+            dur_sec = 7 * 24 * 3600  # 7 days "infinite enough"
+            duration_label = "LIVE"
+        else:
+            used, rem = await remaining_today(db, user.id)
+            tier = await get_tier(db, user.id)
+            if rem <= 0:
+                await update.effective_message.reply_text(
+                    _safe_msg(
+                        t,
+                        "limits.daily_exceeded",
+                        used=fmt_hms(used),
+                        limit=fmt_hms(tier.daily_limit_sec or 0),
+                        reset=reset_str(),
+                    )
+                )
+                return
+            dur_sec = int(rem)
+            duration_label = f"LIVE (max {fmt_hms(dur_sec)})"
+
+    if dur_sec <= 0:
         await update.effective_message.reply_text("❌ Duration must be HH:MM:SS")
         return
 
     # limits (owner bypass)
-    ok, reason = await can_record(db, user.id, dur_sec)
+    ok, reason = await can_record(db, user.id, int(dur_sec))
     if not ok and user.id != OWNER_ID:
         if reason == "need_trial_or_premium":
-            await update.effective_message.reply_text(Msg.get(t, "limits.need_trial_or_premium"))
+            await update.effective_message.reply_text(_safe_msg(t, "limits.need_trial_or_premium"))
             return
         if reason == "trial_no_credits":
-            await update.effective_message.reply_text(Msg.get(t, "limits.trial_no_credits"))
+            await update.effective_message.reply_text(_safe_msg(t, "limits.trial_no_credits"))
             return
         if reason == "daily_exceeded":
-            used, rem = await remaining_today(db, user.id)
+            used, _rem = await remaining_today(db, user.id)
             tier = await get_tier(db, user.id)
             await update.effective_message.reply_text(
-                Msg.get(t, "limits.daily_exceeded", used=fmt_hms(used), limit=fmt_hms(tier.daily_limit_sec or 0), reset=reset_str())
+                _safe_msg(
+                    t,
+                    "limits.daily_exceeded",
+                    used=fmt_hms(used),
+                    limit=fmt_hms(tier.daily_limit_sec or 0),
+                    reset=reset_str(),
+                )
             )
             return
 
     # Resolve source -> url + headers
-    source_kind = "url" if _is_url(source) else "channel"
+    source_kind = "link" if _is_url(source) else "channel"
     url = source
     headers: Dict[str, str] = {}
 
@@ -247,33 +390,33 @@ async def record_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         txt, _ = await fetch_text(url, headers=headers, proxy=proxy_url)
         if is_master_playlist(txt):
             variants, audios = parse_master(txt, base_url=url)
-            if not variants:
-                # treat as normal if parser didn't find variants
-                raise RuntimeError("No variants found")
-            pending_id = new_task_id()
-            pending = {
-                "pending_id": pending_id,
-                "user_id": user.id,
-                "chat_id": update.effective_chat.id,
-                "source_kind": source_kind,
-                "source": source,
-                "resolved_url": url,
-                "headers": headers,
-                "duration_sec": dur_sec,
-                "filename": filename,
-                "variants": variants,
-                "audios": audios,
-                "selected_variant": None,
-                "selected_audios": None,
-                "reply_to_message_id": update.effective_message.message_id,
-            }
-            _pending_store(context)[pending_id] = pending
-            m = await update.effective_message.reply_text(
-                "📽️ Select quality:",
-                reply_markup=quality_keyboard(pending_id, variants),
-            )
-            pending["message_id"] = m.message_id
-            return
+            if variants:
+                pending_id = new_task_id()
+                pend = {
+                    "pending_id": pending_id,
+                    "user_id": user.id,
+                    "chat_id": update.effective_chat.id,
+                    "source_kind": source_kind,
+                    "source": source,
+                    "resolved_url": url,
+                    "headers": headers,
+                    "duration_sec": int(dur_sec),
+                    "duration_label": duration_label,
+                    "filename": filename,
+                    "variants": variants,
+                    "audios": audios or [],
+                    "selected_variant": None,
+                    "reply_to_message_id": update.effective_message.message_id,
+                }
+                store = _pending_store(context)
+                store[pending_id] = pend
+
+                m = await update.effective_message.reply_text(
+                    "📽️ Select quality:",
+                    reply_markup=quality_keyboard(pending_id, variants),
+                )
+                pend["message_id"] = m.message_id
+                return
     except Exception:
         pass
 
@@ -281,20 +424,27 @@ async def record_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tm: TaskManager = context.application.bot_data["task_manager"]
     task_id = new_task_id()
 
-    # Build inputs
-    inputs = RecordingInputs(video_url=url, audio_urls=[], headers=headers, bitrate_bps=None, master_url=None, variant_label=None, audio_choice=None)
-
-    m = await update.effective_message.reply_text(
-        Msg.get(t, "record.queued", task_id=task_id, source=source, duration=duration_s, filename=filename)
+    inputs = RecordingInputs(
+        video_url=url,
+        audio_urls=[],
+        headers=headers,
+        bitrate_bps=None,
+        master_url=None,
+        variant_label=None,
+        audio_choice=None,
     )
 
-    task = RecordingTask(
+    m = await update.effective_message.reply_text(
+        _safe_msg(t, "record.queued", task_id=task_id, source=source, duration=duration_label, filename=filename)
+    )
+
+    task = _task_with_theme(
         task_id=task_id,
         user_id=user.id,
         chat_id=update.effective_chat.id,
         source_kind=source_kind,
         source=source,
-        duration_sec=dur_sec,
+        duration_sec=int(dur_sec),
         filename=filename,
         headers=headers,
         inputs=inputs,
@@ -304,20 +454,18 @@ async def record_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await tm.enqueue(task)
 
+
 async def schedule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await enforce_access_or_reply(update, context):
         return
     user = update.effective_user
     if not user:
         return
+
     db = await _db(context)
     t = await _theme(context, user.id)
 
-    try:
-        parts = shlex.split(update.effective_message.text)
-    except Exception:
-        parts = (update.effective_message.text or "").split()
-
+    parts = _parse_record_parts(update.effective_message.text or "")
     if len(parts) < 4:
         await update.effective_message.reply_text("❌ Usage: /schedule <link|\"channel\"> <time> <file_name> [duration]")
         return
@@ -326,24 +474,34 @@ async def schedule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     time_str = parts[2]
     filename = _norm_filename(parts[3])
     dur_sec = parse_duration_hms(parts[4]) if len(parts) >= 5 else 3600  # default 1 hour
+    if dur_sec is None or dur_sec <= 0:
+        dur_sec = 3600
 
     run_at = parse_run_time(time_str)
     if not run_at:
         await update.effective_message.reply_text("❌ Time format: HH:MM or YYYY-MM-DD HH:MM")
         return
 
-    schedule_id = new_task_id()
-    await db.create_schedule({
-        "schedule_id": schedule_id,
-        "user_id": user.id,
-        "chat_id": update.effective_chat.id,
-        "source": source,
-        "filename": filename,
-        "duration_sec": int(dur_sec),
-        "run_at": run_at.astimezone(ZoneInfo("UTC")),
-    })
+    if not context.application.job_queue:
+        await update.effective_message.reply_text(
+            "❌ JobQueue not available. Install: pip install \"python-telegram-bot[job-queue]\""
+        )
+        return
 
-    # schedule job
+    schedule_id = new_task_id()
+    await db.create_schedule(
+        {
+            "schedule_id": schedule_id,
+            "user_id": user.id,
+            "chat_id": update.effective_chat.id,
+            "source": source,
+            "filename": filename,
+            "duration_sec": int(dur_sec),
+            "run_at": run_at.astimezone(ZoneInfo("UTC")),
+            "status": "scheduled",
+        }
+    )
+
     when = run_at.astimezone(ZoneInfo("UTC"))
     context.application.job_queue.run_once(
         schedule_job,
@@ -351,14 +509,19 @@ async def schedule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data={"schedule_id": schedule_id},
         name=f"schedule_{schedule_id}",
     )
+
     await update.effective_message.reply_text(f"✅ Scheduled `{schedule_id}` at `{run_at.strftime('%Y-%m-%d %H:%M %Z')}`")
 
+
 async def schedule_job(context: ContextTypes.DEFAULT_TYPE):
-    db = context.application.bot_data["db"]
+    db: DB = context.application.bot_data["db"]
     tm: TaskManager = context.application.bot_data["task_manager"]
     bot = context.bot
 
-    schedule_id = context.job.data.get("schedule_id")
+    schedule_id = (context.job.data or {}).get("schedule_id")
+    if not schedule_id:
+        return
+
     doc = await db.db["schedules"].find_one({"schedule_id": schedule_id})
     if not doc or doc.get("status") != "scheduled":
         return
@@ -372,7 +535,7 @@ async def schedule_job(context: ContextTypes.DEFAULT_TYPE):
     theme_name = await ui.get_theme_for_user(context, user_id)
 
     # Resolve source
-    source_kind = "url" if _is_url(source) else "channel"
+    source_kind = "link" if _is_url(source) else "channel"
     url = source
     headers: Dict[str, str] = {}
     if source_kind == "channel":
@@ -394,22 +557,24 @@ async def schedule_job(context: ContextTypes.DEFAULT_TYPE):
     # If master playlist: auto pick best quality + ALL audio
     proxy_url = await db.get_setting("proxy_url", None)
     inputs = RecordingInputs(video_url=url, audio_urls=[], headers=headers, bitrate_bps=None, master_url=None, variant_label=None, audio_choice=None)
+
     try:
         txt, _ = await fetch_text(url, headers=headers, proxy=proxy_url)
         if is_master_playlist(txt):
             variants, audios = parse_master(txt, base_url=url)
             if variants:
-                # pick highest bandwidth
-                def bw(v):
+
+                def _bw(v):
                     try:
-                        return int(v.get("bandwidth") or 0)
+                        return int(v.get("bandwidth") or v.get("attrs", {}).get("BANDWIDTH") or 0)
                     except Exception:
                         return 0
-                best = sorted(variants, key=bw, reverse=True)[0]
-                bitrate = bw(best)
+
+                best = sorted(variants, key=_bw, reverse=True)[0]
+                bitrate = _bw(best)
                 inputs = RecordingInputs(
                     video_url=best["url"],
-                    audio_urls=[a["url"] for a in audios] if audios else [],
+                    audio_urls=[a["url"] for a in (audios or [])] if audios else [],
                     headers=headers,
                     bitrate_bps=bitrate if bitrate > 0 else None,
                     master_url=url,
@@ -422,9 +587,9 @@ async def schedule_job(context: ContextTypes.DEFAULT_TYPE):
     task_id = schedule_id  # reuse id
     m = await bot.send_message(
         chat_id=chat_id,
-        text=Msg.get(theme_name, "record.queued", task_id=task_id, source=source, duration=fmt_hms(duration_sec), filename=filename),
+        text=_safe_msg(theme_name, "record.queued", task_id=task_id, source=source, duration=fmt_hms(duration_sec), filename=filename),
     )
-    task = RecordingTask(
+    task = _task_with_theme(
         task_id=task_id,
         user_id=user_id,
         chat_id=chat_id,
@@ -438,416 +603,4 @@ async def schedule_job(context: ContextTypes.DEFAULT_TYPE):
         theme_name=theme_name,
     )
     await tm.enqueue(task)
-    await db.update_schedule(schedule_id, {"status": "queued"})
-
-async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await enforce_access_or_reply(update, context):
-        return
-    user = update.effective_user
-    if not user:
-        return
-    tm: TaskManager = context.application.bot_data["task_manager"]
-    target_id = user.id
-
-    # Owner can cancel by reply
-    if user.id == OWNER_ID and update.effective_message.reply_to_message and update.effective_message.reply_to_message.from_user:
-        target_id = update.effective_message.reply_to_message.from_user.id
-
-    n = await tm.cancel_user(target_id)
-    t = await _theme(context, user.id)
-    await update.effective_message.reply_text(f"✅ Cancelled: {n}")
-
-async def tasks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await enforce_access_or_reply(update, context):
-        return
-    user = update.effective_user
-    if not user:
-        return
-    t = await _theme(context, user.id)
-    tm: TaskManager = context.application.bot_data["task_manager"]
-    snap = await tm.snapshot()
-
-    lines = [Msg.get(t, "tasks.header")]
-    lines.append(Msg.get(t, "tasks.active", count=len(snap["active"])))
-    for it in snap["active"][:15]:
-        lines.append(Msg.get(t, "tasks.item", task_id=it["task_id"], user=it["user_id"], state=it["state"], name=it["filename"]))
-    lines.append(Msg.get(t, "tasks.queued", count=len(snap["queued"])))
-    for it in snap["queued"][:15]:
-        lines.append(Msg.get(t, "tasks.item", task_id=it["task_id"], user=it["user_id"], state=it["state"], name=it["filename"]))
-    await update.effective_message.reply_text("\n".join(lines))
-
-async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await enforce_access_or_reply(update, context):
-        return
-    user = update.effective_user
-    if not user:
-        return
-    db = await _db(context)
-    t = await _theme(context, user.id)
-    tier = await get_tier(db, user.id)
-    used, rem = await remaining_today(db, user.id)
-    lim = tier.daily_limit_sec or 0
-    await update.effective_message.reply_text(
-        Msg.get(
-            t,
-            "status.text",
-            user_id=str(user.id),
-            tier=tier.tier,
-            used=fmt_hms(used),
-            limit=("∞" if tier.tier == "owner" else fmt_hms(lim)),
-            trial=str(tier.trial_credits),
-            premium=(tier.premium_until.isoformat() if tier.premium_until else "-"),
-            reset=reset_str(),
-        )
-    )
-
-async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await enforce_access_or_reply(update, context):
-        return
-    user = update.effective_user
-    if not user:
-        return
-    t = await _theme(context, user.id)
-    tm: TaskManager = context.application.bot_data["task_manager"]
-    snap = await tm.snapshot()
-    cpu = psutil.cpu_percent(interval=0.3)
-    ram = psutil.virtual_memory().percent
-    await update.effective_message.reply_text(
-        Msg.get(t, "stats.text", cpu=cpu, ram=ram, active=len(snap["active"]), queued=len(snap["queued"]), version=BOT_VERSION)
-    )
-
-# -------------------------
-# Proxy (owner)
-# -------------------------
-
-async def proxy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user:
-        return
-    db = await _db(context)
-    t = await _theme(context, user.id)
-
-    if user.id != OWNER_ID:
-        await update.effective_message.reply_text(Msg.get(t, "auth.only_owner"))
-        return
-
-    if context.args:
-        px = context.args[0].strip()
-        await db.set_setting("proxy_url", px)
-        await update.effective_message.reply_text(Msg.get(t, "proxy.set_ok", proxy=px))
-        return
-
-    cur = await db.get_setting("proxy_url", None)
-    if cur:
-        await update.effective_message.reply_text(Msg.get(t, "proxy.current", proxy=cur), reply_markup=proxy_remove_keyboard())
-    else:
-        await update.effective_message.reply_text(Msg.get(t, "proxy.none"))
-
-# -------------------------
-# Auth / trial (owner)
-# -------------------------
-
-def _parse_auth_delta(s: str) -> Optional[_dt.timedelta]:
-    s = (s or "").strip().lower()
-    if not s:
-        return None
-    if s.endswith("d"):
-        return _dt.timedelta(days=int(s[:-1]))
-    if s.endswith("h"):
-        return _dt.timedelta(hours=int(s[:-1]))
-    if s.endswith("m"):
-        return _dt.timedelta(minutes=int(s[:-1]))
-    return None
-
-async def auth_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user:
-        return
-    if user.id != OWNER_ID:
-        t = await _theme(context, user.id)
-        await update.effective_message.reply_text(Msg.get(t, "auth.only_owner"))
-        return
-
-    if not update.effective_message.reply_to_message or not update.effective_message.reply_to_message.from_user:
-        await update.effective_message.reply_text("❌ Reply to a user message with /auth 1d or /auth 30d")
-        return
-    if not context.args:
-        await update.effective_message.reply_text("❌ /auth 1d or /auth 30d")
-        return
-
-    delta = _parse_auth_delta(context.args[0])
-    if not delta:
-        await update.effective_message.reply_text("❌ invalid duration. Example: 1d, 30d, 12h")
-        return
-
-    target = update.effective_message.reply_to_message.from_user.id
-    db = await _db(context)
-    t = await _theme(context, user.id)
-    now = _dt.datetime.utcnow()
-    u = await db.get_user(target)
-    cur = u.get("premium_until")
-    if cur and isinstance(cur, _dt.datetime) and cur > now:
-        until = cur + delta
-    else:
-        until = now + delta
-    await db.update_user(target, {"premium_until": until})
-    await update.effective_message.reply_text(Msg.get(t, "auth.ok", user_id=str(target), until=until.isoformat()))
-
-async def rm_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user:
-        return
-    if user.id != OWNER_ID:
-        t = await _theme(context, user.id)
-        await update.effective_message.reply_text(Msg.get(t, "auth.only_owner"))
-        return
-
-    if not update.effective_message.reply_to_message or not update.effective_message.reply_to_message.from_user:
-        await update.effective_message.reply_text("❌ Reply to a user message with /rm")
-        return
-
-    target = update.effective_message.reply_to_message.from_user.id
-    db = await _db(context)
-    t = await _theme(context, user.id)
-    await db.update_user(target, {"premium_until": None})
-    await update.effective_message.reply_text(Msg.get(t, "auth.rm_ok", user_id=str(target)))
-
-async def trial_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user:
-        return
-    if user.id != OWNER_ID:
-        t = await _theme(context, user.id)
-        await update.effective_message.reply_text(Msg.get(t, "auth.only_owner"))
-        return
-
-    if not update.effective_message.reply_to_message or not update.effective_message.reply_to_message.from_user:
-        await update.effective_message.reply_text("❌ Reply to a user message with /trial 1|2|3")
-        return
-    if not context.args:
-        await update.effective_message.reply_text("❌ /trial 1|2|3")
-        return
-
-    try:
-        credits = int(context.args[0])
-    except Exception:
-        await update.effective_message.reply_text("❌ /trial 1|2|3")
-        return
-    credits = max(0, min(credits, 100))
-
-    target = update.effective_message.reply_to_message.from_user.id
-    db = await _db(context)
-    t = await _theme(context, user.id)
-    await db.update_user(target, {"trial_credits": credits})
-    await update.effective_message.reply_text(Msg.get(t, "trial.set_ok", user_id=str(target), credits=str(credits)))
-
-# -------------------------
-# Callback queries (quality/audio/proxy)
-# -------------------------
-
-async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    if not q or not q.data:
-        return
-    user = update.effective_user
-    if not user:
-        return
-    db = await _db(context)
-    t = await _theme(context, user.id)
-
-    data = q.data
-    await q.answer()
-
-    # Proxy remove
-    if data == "px|rm":
-        if user.id != OWNER_ID:
-            return
-        await db.set_setting("proxy_url", None)
-        try:
-            await q.edit_message_text(Msg.get(t, "proxy.removed"))
-        except Exception:
-            pass
-        return
-
-    # Pending selectors
-    store = _pending_store(context)
-
-    if data.startswith("c|"):
-        pending_id = data.split("|", 1)[1]
-        pend = store.get(pending_id)
-        if not pend:
-            return
-        if user.id != pend["user_id"] and user.id != OWNER_ID:
-            return
-        store.pop(pending_id, None)
-        try:
-            await q.edit_message_text(Msg.get(t, "record.cancelled", task_id=pending_id))
-        except Exception:
-            pass
-        return
-
-    if data.startswith("q|"):
-        _, pending_id, variant_id = data.split("|", 2)
-        pend = store.get(pending_id)
-        if not pend:
-            return
-        if user.id != pend["user_id"] and user.id != OWNER_ID:
-            return
-        # store selected variant
-        variants = pend["variants"]
-        sel = next((v for v in variants if v["id"] == variant_id), None)
-        if not sel:
-            return
-        pend["selected_variant"] = sel
-        audios = pend.get("audios") or []
-        if audios:
-            try:
-                await q.edit_message_text("🎶 Select audio:", reply_markup=audio_keyboard(pending_id, audios))
-            except Exception:
-                pass
-        else:
-            await _finalize_pending(context, pending_id, audio_list=None, audio_choice_id=None, q=q)
-        return
-
-    if data.startswith("a|"):
-        _, pending_id, audio_id = data.split("|", 2)
-        pend = store.get(pending_id)
-        if not pend:
-            return
-        if user.id != pend["user_id"] and user.id != OWNER_ID:
-            return
-        audios = pend.get("audios") or []
-        if audio_id == "ALL":
-            selected = audios
-        else:
-            selected = [a for a in audios if a["id"] == audio_id]
-        await _finalize_pending(context, pending_id, audio_list=selected, audio_choice_id=('ALL' if audio_id=='ALL' else (selected[0]['id'] if selected else None)), q=q)
-        return
-
-async def _finalize_pending(context: ContextTypes.DEFAULT_TYPE, pending_id: str, audio_list, audio_choice_id, q):
-    store = _pending_store(context)
-    pend = store.get(pending_id)
-    if not pend:
-        return
-    user_id = pend["user_id"]
-    chat_id = pend["chat_id"]
-    db = await _db(context)
-    tm: TaskManager = context.application.bot_data["task_manager"]
-    theme_name = await ui.get_theme_for_user(context, user_id)
-
-    variant = pend.get("selected_variant")
-    if not variant:
-        return
-
-    headers = pend.get("headers") or {}
-    # bitrate
-    bitrate = None
-    try:
-        b = variant.get("bandwidth") or variant.get("attrs", {}).get("BANDWIDTH")
-        bitrate = int(b) if b else None
-    except Exception:
-        bitrate = None
-
-    audio_urls = [a["url"] for a in (audio_list or [])]
-    inputs = RecordingInputs(video_url=variant["url"], audio_urls=audio_urls, headers=headers, bitrate_bps=bitrate, master_url=pend.get('resolved_url'), variant_label=variant.get('label'), audio_choice=audio_choice_id)
-
-    # Create task and enqueue
-    task_id = pending_id
-    try:
-        await q.edit_message_text(
-            Msg.get(theme_name, "record.queued", task_id=task_id, source=pend["source"], duration=fmt_hms(pend["duration_sec"]), filename=pend["filename"])
-        )
-    except Exception:
-        pass
-
-    task = RecordingTask(
-        task_id=task_id,
-        user_id=user_id,
-        chat_id=chat_id,
-        source_kind=pend["source_kind"],
-        source=pend["source"],
-        duration_sec=pend["duration_sec"],
-        filename=pend["filename"],
-        headers=headers,
-        inputs=inputs,
-        progress_message_id=pend.get("message_id") or q.message.message_id,
-        reply_to_message_id=pend.get("reply_to_message_id"),
-        theme_name=theme_name,
-    )
-    await tm.enqueue(task)
-    store.pop(pending_id, None)
-
-# -------------------------
-# Startup / background jobs
-# -------------------------
-
-async def post_init(app):
-    # Connect DB
-    db = await DB.connect()
-    app.bot_data["db"] = db
-
-    # Task manager
-    async def executor(task: RecordingTask):
-        await run_recording_task(bot=app.bot, db=db, task=task, theme_name=task.theme_name)
-
-    tm = TaskManager(executor=executor)
-    app.bot_data["task_manager"] = tm
-    await tm.start()
-
-    # Playlist refresh job (every 5 minutes)
-    async def refresh_job(context: ContextTypes.DEFAULT_TYPE):
-        proxy_url = await db.get_setting("proxy_url", None)
-        try:
-            await refresh_all_playlists_job(db, app.bot, proxy=proxy_url)
-        except Exception:
-            pass
-
-    app.job_queue.run_repeating(refresh_job, interval=PLAYLIST_REFRESH_SEC, first=PLAYLIST_REFRESH_SEC, name="playlist_refresh")
-
-async def post_shutdown(app):
-    tm: TaskManager = app.bot_data.get("task_manager")
-    if tm:
-        await tm.stop()
-    db: DB = app.bot_data.get("db")
-    if db:
-        await db.close()
-
-def main():
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is not set. Export BOT_TOKEN in environment.")
-
-    application = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        .post_init(post_init)
-        .post_shutdown(post_shutdown)
-        .build()
-    )
-
-    # commands
-    application.add_handler(CommandHandler("start", start_cmd))
-    application.add_handler(CommandHandler("help", help_cmd))
-    application.add_handler(CommandHandler("playlist", playlist_cmd))
-    application.add_handler(CommandHandler("channel", channel_cmd))
-    application.add_handler(CommandHandler("record", record_cmd))
-    application.add_handler(CommandHandler("schedule", schedule_cmd))
-    application.add_handler(CommandHandler("cancel", cancel_cmd))
-    application.add_handler(CommandHandler("tasks", tasks_cmd))
-    application.add_handler(CommandHandler(["status","Status"], status_cmd))
-    application.add_handler(CommandHandler(["stats","Stats"], stats_cmd))
-    application.add_handler(CommandHandler("proxy", proxy_cmd))
-    application.add_handler(CommandHandler("auth", auth_cmd))
-    application.add_handler(CommandHandler("rm", rm_cmd))
-    application.add_handler(CommandHandler("trial", trial_cmd))
-    application.add_handler(CommandHandler("hot", hot_cmd))
-    application.add_handler(CommandHandler("cold", cold_cmd))
-    application.add_handler(CommandHandler("dark", dark_cmd))
-
-    # callbacks
-    application.add_handler(CallbackQueryHandler(callbacks))
-
-    application.run_polling(close_loop=False)
-
-if __name__ == "__main__":
-    main()
+    await db.up
